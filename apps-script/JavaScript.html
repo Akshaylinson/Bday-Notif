@@ -1,0 +1,676 @@
+<script>
+  // Application client-side state
+  var appState = {
+    people: [],
+    settings: {
+      recipientEmail: '',
+      dailyTriggerHour: 8,
+      timezone: 'Asia/Kolkata',
+      leapDayPolicy: 'FEB_28',
+      spreadsheetId: '',
+      triggerInstalled: false
+    },
+    emailLogs: [],
+    triggerStatus: { isInstalled: false },
+    currentTab: 'dashboard',
+    filter: 'all',
+    sort: 'upcoming',
+    searchQuery: '',
+    loading: false
+  };
+
+  // On page load
+  window.addEventListener('DOMContentLoaded', function () {
+    loadInitialData();
+  });
+
+  function showToast(message, isError) {
+    var toast = document.getElementById('toast');
+    var msgSpan = document.getElementById('toast-message');
+    var iconSpan = document.getElementById('toast-icon');
+
+    msgSpan.textContent = message;
+    iconSpan.textContent = isError ? '⚠️' : '✅';
+    toast.style.background = isError ? '#991b1b' : '#0f172a';
+    toast.classList.add('show');
+
+    setTimeout(function () {
+      toast.classList.remove('show');
+    }, 4000);
+  }
+
+  function loadInitialData() {
+    if (typeof google === 'undefined' || !google.script || !google.script.run) {
+      console.warn('google.script.run not available. Running in preview or standalone mode.');
+      return;
+    }
+
+    google.script.run
+      .withSuccessHandler(function (response) {
+        if (!response) return;
+        appState.people = response.people || [];
+        appState.settings = response.settings || {};
+        appState.emailLogs = response.emailLogs || [];
+        appState.triggerStatus = response.triggerStatus || { isInstalled: false };
+
+        renderAll();
+      })
+      .withFailureHandler(function (error) {
+        showToast('Error loading database: ' + error.message, true);
+      })
+      .getInitialData();
+  }
+
+  function reloadInitialData() {
+    showToast('Refreshing data from Google Sheets...', false);
+    loadInitialData();
+  }
+
+  // Navigation
+  function switchTab(tabName) {
+    appState.currentTab = tabName;
+
+    var tabs = ['dashboard', 'people', 'upcoming', 'logs', 'settings'];
+    for (var i = 0; i < tabs.length; i++) {
+      var t = tabs[i];
+      var section = document.getElementById('view-' + t);
+      if (section) section.style.display = (t === tabName) ? 'block' : 'none';
+    }
+
+    var navBtns = document.querySelectorAll('.nav-btn');
+    navBtns.forEach(function (btn, idx) {
+      btn.classList.toggle('active', tabs[idx] === tabName);
+    });
+
+    var titles = {
+      dashboard: 'Dashboard Overview',
+      people: 'All Saved People',
+      upcoming: 'Upcoming Birthdays Timeline',
+      logs: 'Email History & Logs',
+      settings: 'Settings & Automation'
+    };
+    document.getElementById('page-title').textContent = titles[tabName] || 'Birthday Reminder';
+
+    if (tabName === 'people') filterPeopleTable();
+    if (tabName === 'upcoming') renderUpcomingTimeline();
+  }
+
+  // Leap year and calendar calculations in client for instant rendering
+  function isLeapYear(year) {
+    return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  }
+
+  function getClientNowInTz() {
+    var tz = appState.settings.timezone || 'Asia/Kolkata';
+    try {
+      var formatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      });
+      var parts = formatter.format(new Date()).split('-');
+      return {
+        year: parseInt(parts[0], 10),
+        month: parseInt(parts[1], 10),
+        day: parseInt(parts[2], 10),
+        dateString: parts[0] + '-' + parts[1] + '-' + parts[2]
+      };
+    } catch (e) {
+      var d = new Date();
+      var y = d.getFullYear();
+      var m = ('0' + (d.getMonth() + 1)).slice(-2);
+      var day = ('0' + d.getDate()).slice(-2);
+      return { year: y, month: d.getMonth() + 1, day: d.getDate(), dateString: y + '-' + m + '-' + day };
+    }
+  }
+
+  function calculatePersonMetrics(person) {
+    var now = getClientNowInTz();
+    var bParts = person.dateOfBirth.split('-');
+    var bYear = parseInt(bParts[0], 10);
+    var bMonth = parseInt(bParts[1], 10);
+    var bDay = parseInt(bParts[2], 10);
+    var isFeb29 = (bMonth === 2 && bDay === 29);
+    var policy = appState.settings.leapDayPolicy || 'FEB_28';
+
+    function getMD(yr) {
+      if (!isFeb29) return { m: bMonth, d: bDay };
+      if (isLeapYear(yr)) return { m: 2, d: 29 };
+      return (policy === 'MAR_01') ? { m: 3, d: 1 } : { m: 2, d: 28 };
+    }
+
+    var thisYearMD = getMD(now.year);
+    var thisYearStr = now.year + '-' + ('0' + thisYearMD.m).slice(-2) + '-' + ('0' + thisYearMD.d).slice(-2);
+
+    var d1 = Date.UTC(now.year, now.month - 1, now.day);
+    var d2 = Date.UTC(now.year, thisYearMD.m - 1, thisYearMD.d);
+    var diffDays = Math.round((d2 - d1) / (1000 * 60 * 60 * 24));
+
+    var nextStr = thisYearStr;
+    var nextYr = now.year;
+
+    if (diffDays < 0) {
+      nextYr = now.year + 1;
+      var nextMD = getMD(nextYr);
+      nextStr = nextYr + '-' + ('0' + nextMD.m).slice(-2) + '-' + ('0' + nextMD.d).slice(-2);
+      var dNext = Date.UTC(nextYr, nextMD.m - 1, nextMD.d);
+      diffDays = Math.round((dNext - d1) / (1000 * 60 * 60 * 24));
+    }
+
+    var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    var targetMD = getMD(nextYr);
+
+    return {
+      person: person,
+      nextBirthdayStr: nextStr,
+      formattedShort: months[targetMD.m - 1] + ' ' + targetMD.d,
+      daysRemaining: diffDays,
+      turningAge: nextYr - bYear,
+      isToday: diffDays === 0,
+      isTomorrow: diffDays === 1,
+      isWeek: diffDays >= 0 && diffDays <= 7,
+      isMonth: diffDays >= 0 && diffDays <= 30
+    };
+  }
+
+  // Render everything
+  function renderAll() {
+    var people = appState.people || [];
+    var calcs = people.map(calculatePersonMetrics);
+    calcs.sort(function (a, b) { return a.daysRemaining - b.daysRemaining; });
+
+    // Update stats
+    var todayList = calcs.filter(function (c) { return c.isToday; });
+    var weekList = calcs.filter(function (c) { return c.daysRemaining > 0 && c.daysRemaining <= 7; });
+    var monthList = calcs.filter(function (c) { return c.daysRemaining > 0 && c.daysRemaining <= 30; });
+
+    document.getElementById('stat-total').textContent = people.length;
+    document.getElementById('stat-today').textContent = todayList.length;
+    document.getElementById('stat-week').textContent = weekList.length;
+    document.getElementById('stat-month').textContent = monthList.length;
+    document.getElementById('sidebar-count').textContent = people.length;
+
+    // Today banner
+    var todayBanner = document.getElementById('today-banner');
+    if (todayList.length > 0) {
+      todayBanner.style.display = 'flex';
+      var names = todayList.map(function (c) { return c.person.name + ' (' + c.turningAge + ')'; }).join(', ');
+      document.getElementById('today-banner-desc').textContent = names;
+    } else {
+      todayBanner.style.display = 'none';
+    }
+
+    // Hero Spotlight
+    var next = calcs.length > 0 ? calcs[0] : null;
+    if (next) {
+      document.getElementById('hero-name').textContent = next.person.name;
+      var ageMsg = next.turningAge > 0 ? ('Turning ' + next.turningAge + ' years old on ' + next.formattedShort) : ('Birthday on ' + next.formattedShort);
+      document.getElementById('hero-sub').textContent = ageMsg;
+      document.getElementById('hero-notes').textContent = next.person.notes ? ('Note: ' + next.person.notes) : '';
+
+      if (next.daysRemaining === 0) {
+        document.getElementById('hero-days').textContent = 'TODAY';
+        document.getElementById('hero-unit').textContent = 'Celebration!';
+      } else if (next.daysRemaining === 1) {
+        document.getElementById('hero-days').textContent = '1';
+        document.getElementById('hero-unit').textContent = 'Day Left (Tomorrow)';
+      } else {
+        document.getElementById('hero-days').textContent = next.daysRemaining;
+        document.getElementById('hero-unit').textContent = 'Days Left';
+      }
+    } else {
+      document.getElementById('hero-name').textContent = 'No Birthdays Added';
+      document.getElementById('hero-sub').textContent = 'Add your friends and family to begin tracking.';
+      document.getElementById('hero-notes').textContent = '';
+      document.getElementById('hero-days').textContent = '0';
+      document.getElementById('hero-unit').textContent = 'Days';
+    }
+
+    // Dashboard 30-day table
+    var dbBody = document.getElementById('dashboard-table-body');
+    var dbEmpty = document.getElementById('dashboard-empty');
+    dbBody.innerHTML = '';
+
+    var previewList = calcs.filter(function (c) { return c.daysRemaining >= 0 && c.daysRemaining <= 30; });
+    if (previewList.length === 0) {
+      dbEmpty.style.display = 'block';
+    } else {
+      dbEmpty.style.display = 'none';
+      for (var i = 0; i < previewList.length; i++) {
+        var item = previewList[i];
+        var tr = document.createElement('tr');
+        var daysText = item.daysRemaining === 0 ? '<strong style="color: #4f46e5;">Today! 🎉</strong>' : (item.daysRemaining === 1 ? 'Tomorrow' : item.daysRemaining + ' days');
+        tr.innerHTML = [
+          '<td><strong>' + escapeHtml(item.person.name) + '</strong></td>',
+          '<td class="tabular-nums">' + item.person.dateOfBirth + '</td>',
+          '<td>' + item.formattedShort + '</td>',
+          '<td class="tabular-nums">' + item.turningAge + '</td>',
+          '<td class="tabular-nums">' + daysText + '</td>',
+          '<td style="color: #64748b; font-size: 13px;">' + escapeHtml(item.person.notes || '—') + '</td>'
+        ].join('');
+        dbBody.appendChild(tr);
+      }
+    }
+
+    // Populate Settings Form fields
+    document.getElementById('setting-email').value = appState.settings.recipientEmail || '';
+    document.getElementById('setting-hour').value = appState.settings.dailyTriggerHour || 8;
+    document.getElementById('setting-leap').value = appState.settings.leapDayPolicy || 'FEB_28';
+    document.getElementById('spreadsheet-id-display').textContent = appState.settings.spreadsheetId || 'Active Bound Sheet';
+
+    // Update Trigger status badge
+    var isTrg = appState.triggerStatus && appState.triggerStatus.isInstalled;
+    var badge = document.getElementById('trigger-badge');
+    badge.textContent = isTrg ? 'Active (Scheduled Daily)' : 'Not Installed';
+    badge.style.color = isTrg ? '#16a34a' : '#d97706';
+    document.getElementById('sidebar-trigger-status').textContent = 'Trigger: ' + (isTrg ? 'Installed' : 'Disabled');
+
+    // Email logs
+    renderLogs();
+  }
+
+  function filterPeopleTable() {
+    var search = (document.getElementById('search-input').value || '').toLowerCase().trim();
+    var filter = document.getElementById('filter-select').value;
+    var sort = document.getElementById('sort-select').value;
+
+    var calcs = appState.people.map(calculatePersonMetrics);
+
+    // Filter
+    var filtered = calcs.filter(function (c) {
+      var matchesSearch = !search ||
+        c.person.name.toLowerCase().indexOf(search) !== -1 ||
+        (c.person.notes && c.person.notes.toLowerCase().indexOf(search) !== -1);
+
+      if (!matchesSearch) return false;
+
+      if (filter === 'today') return c.isToday;
+      if (filter === 'week') return c.isWeek;
+      if (filter === 'month') return c.isMonth;
+      if (filter === 'leap') return (c.person.dateOfBirth.slice(5) === '02-29');
+      return true;
+    });
+
+    // Sort
+    filtered.sort(function (a, b) {
+      if (sort === 'upcoming') return a.daysRemaining - b.daysRemaining;
+      if (sort === 'name-asc') return a.person.name.localeCompare(b.person.name);
+      if (sort === 'name-desc') return b.person.name.localeCompare(a.person.name);
+      if (sort === 'dob-asc') return a.person.dateOfBirth.localeCompare(b.person.dateOfBirth);
+      if (sort === 'dob-desc') return b.person.dateOfBirth.localeCompare(a.person.dateOfBirth);
+      return 0;
+    });
+
+    var tbody = document.getElementById('people-table-body');
+    var empty = document.getElementById('people-empty');
+    tbody.innerHTML = '';
+
+    if (filtered.length === 0) {
+      empty.style.display = 'block';
+    } else {
+      empty.style.display = 'none';
+      for (var i = 0; i < filtered.length; i++) {
+        var c = filtered[i];
+        var tr = document.createElement('tr');
+        var daysText = c.daysRemaining === 0 ? '<strong style="color: #4f46e5;">Today! 🎂</strong>' : (c.daysRemaining === 1 ? 'Tomorrow' : c.daysRemaining + ' days');
+
+        tr.innerHTML = [
+          '<td><strong>' + escapeHtml(c.person.name) + '</strong></td>',
+          '<td class="tabular-nums">' + c.person.dateOfBirth + '</td>',
+          '<td>' + c.formattedShort + '</td>',
+          '<td class="tabular-nums">' + daysText + '</td>',
+          '<td style="color: #64748b; font-size: 13px; max-width: 240px; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">' + escapeHtml(c.person.notes || '—') + '</td>',
+          '<td style="text-align: right;">' +
+            '<button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px; margin-right: 6px;" onclick="openEditPersonModal(\'' + c.person.id + '\')">Edit</button>' +
+            '<button class="btn btn-danger" style="padding: 4px 10px; font-size: 12px;" onclick="openDeletePersonModal(\'' + c.person.id + '\', \'' + escapeHtml(c.person.name) + '\')">Delete</button>' +
+          '</td>'
+        ].join('');
+        tbody.appendChild(tr);
+      }
+    }
+  }
+
+  function renderUpcomingTimeline() {
+    var container = document.getElementById('upcoming-groups-container');
+    container.innerHTML = '';
+
+    var calcs = appState.people.map(calculatePersonMetrics);
+    calcs.sort(function (a, b) { return a.daysRemaining - b.daysRemaining; });
+
+    var groups = {
+      today: { title: 'Today 🎉', items: [] },
+      week: { title: 'This Week', items: [] },
+      month: { title: 'This Month', items: [] },
+      later: { title: 'Later this Year & Next Year', items: [] }
+    };
+
+    for (var i = 0; i < calcs.length; i++) {
+      var item = calcs[i];
+      if (item.isToday) groups.today.items.push(item);
+      else if (item.daysRemaining <= 7) groups.week.items.push(item);
+      else if (item.daysRemaining <= 30) groups.month.items.push(item);
+      else groups.later.items.push(item);
+    }
+
+    var groupKeys = ['today', 'week', 'month', 'later'];
+    for (var g = 0; g < groupKeys.length; g++) {
+      var grp = groups[groupKeys[g]];
+      if (grp.items.length === 0) continue;
+
+      var grpCard = document.createElement('div');
+      grpCard.className = 'card-container';
+      grpCard.style.marginBottom = '20px';
+
+      var header = document.createElement('div');
+      header.className = 'card-header';
+      header.innerHTML = '<h3 style="font-size: 15px; font-weight: 600;">' + grp.title + ' (' + grp.items.length + ')</h3>';
+      grpCard.appendChild(header);
+
+      var table = document.createElement('table');
+      table.className = 'table';
+      table.innerHTML = '<thead><tr><th>Name</th><th>Date</th><th>Countdown</th><th>Turning Age</th><th>Notes</th></tr></thead>';
+      var tb = document.createElement('tbody');
+
+      for (var k = 0; k < grp.items.length; k++) {
+        var it = grp.items[k];
+        var tr = document.createElement('tr');
+        var countdown = it.daysRemaining === 0 ? '<strong style="color: #4f46e5;">Today!</strong>' : (it.daysRemaining === 1 ? 'Tomorrow' : 'In ' + it.daysRemaining + ' days');
+        tr.innerHTML = [
+          '<td><strong>' + escapeHtml(it.person.name) + '</strong></td>',
+          '<td>' + it.formattedShort + '</td>',
+          '<td class="tabular-nums">' + countdown + '</td>',
+          '<td class="tabular-nums">' + it.turningAge + ' yrs</td>',
+          '<td style="color: #64748b; font-size: 13px;">' + escapeHtml(it.person.notes || '—') + '</td>'
+        ].join('');
+        tb.appendChild(tr);
+      }
+      table.appendChild(tb);
+      grpCard.appendChild(table);
+      container.appendChild(grpCard);
+    }
+
+    if (calcs.length === 0) {
+      container.innerHTML = '<div class="empty-state"><h3>No upcoming birthdays</h3><p>Add people to start tracking birthdays.</p></div>';
+    }
+  }
+
+  function renderLogs() {
+    var logs = appState.emailLogs || [];
+    var tbody = document.getElementById('logs-table-body');
+    var empty = document.getElementById('logs-empty');
+    tbody.innerHTML = '';
+
+    if (logs.length === 0) {
+      empty.style.display = 'block';
+    } else {
+      empty.style.display = 'none';
+      for (var i = 0; i < logs.length; i++) {
+        var l = logs[i];
+        var tr = document.createElement('tr');
+        var statusColor = '#475569';
+        if (l.status === 'SENT') statusColor = '#16a34a';
+        else if (l.status === 'SKIPPED_DUPLICATE') statusColor = '#4f46e5';
+        else if (l.status === 'FAILED') statusColor = '#dc2626';
+        else if (l.status === 'TEST') statusColor = '#0284c7';
+
+        tr.innerHTML = [
+          '<td><strong>' + escapeHtml(l.personName || 'System') + '</strong></td>',
+          '<td class="tabular-nums">' + (l.birthdayDate || '—') + '</td>',
+          '<td style="font-size: 13px;">' + escapeHtml(l.recipient || '—') + '</td>',
+          '<td><span style="font-size: 12px; font-weight: 600; color: ' + statusColor + ';">' + l.status + '</span></td>',
+          '<td class="tabular-nums" style="font-size: 12px; color: #64748b;">' + (l.sentAt ? l.sentAt.replace('T', ' ').substring(0, 19) : '—') + '</td>',
+          '<td style="font-size: 13px; color: #64748b;">' + escapeHtml(l.errorMessage || 'Delivered successfully') + '</td>'
+        ].join('');
+        tbody.appendChild(tr);
+      }
+    }
+  }
+
+  // Modals & Submissions
+  function openAddPersonModal() {
+    document.getElementById('modal-title').textContent = 'Add Person';
+    document.getElementById('person-id').value = '';
+    document.getElementById('person-name').value = '';
+    document.getElementById('person-dob').value = '';
+    document.getElementById('person-notes').value = '';
+    document.getElementById('modal-error').style.display = 'none';
+    document.getElementById('person-modal').style.display = 'flex';
+  }
+
+  function openEditPersonModal(id) {
+    var person = appState.people.find(function (p) { return p.id === id; });
+    if (!person) return;
+
+    document.getElementById('modal-title').textContent = 'Edit Person';
+    document.getElementById('person-id').value = person.id;
+    document.getElementById('person-name').value = person.name;
+    document.getElementById('person-dob').value = person.dateOfBirth;
+    document.getElementById('person-notes').value = person.notes || '';
+    document.getElementById('modal-error').style.display = 'none';
+    document.getElementById('person-modal').style.display = 'flex';
+  }
+
+  function closePersonModal() {
+    document.getElementById('person-modal').style.display = 'none';
+  }
+
+  function handlePersonSubmit(e) {
+    e.preventDefault();
+    var id = document.getElementById('person-id').value;
+    var name = document.getElementById('person-name').value.trim();
+    var dob = document.getElementById('person-dob').value.trim();
+    var notes = document.getElementById('person-notes').value.trim();
+
+    var errBox = document.getElementById('modal-error');
+    if (!name) {
+      errBox.textContent = 'Please enter a full name.';
+      errBox.style.display = 'block';
+      return;
+    }
+    if (!dob) {
+      errBox.textContent = 'Please enter a valid date of birth.';
+      errBox.style.display = 'block';
+      return;
+    }
+
+    var payload = {
+      id: id || undefined,
+      name: name,
+      dateOfBirth: dob,
+      notes: notes
+    };
+
+    var btn = document.getElementById('modal-submit-btn');
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        btn.disabled = false;
+        btn.textContent = 'Save Birthday';
+        if (res && res.success) {
+          closePersonModal();
+          showToast('Person successfully saved to Google Sheet!', false);
+          loadInitialData();
+        } else {
+          errBox.textContent = (res && res.error) ? res.error : 'Failed to save person.';
+          errBox.style.display = 'block';
+        }
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = 'Save Birthday';
+        errBox.textContent = err.message;
+        errBox.style.display = 'block';
+      })
+      .apiSavePerson(payload);
+  }
+
+  function openDeletePersonModal(id, name) {
+    document.getElementById('delete-person-id').value = id;
+    document.getElementById('delete-confirm-text').textContent =
+      'Are you sure you want to delete "' + name + '"? This will remove them from recurring birthday reminders.';
+    document.getElementById('delete-modal').style.display = 'flex';
+  }
+
+  function closeDeleteModal() {
+    document.getElementById('delete-modal').style.display = 'none';
+  }
+
+  function executeDeletePerson() {
+    var id = document.getElementById('delete-person-id').value;
+    var btn = document.getElementById('confirm-delete-btn');
+    btn.disabled = true;
+    btn.textContent = 'Deleting...';
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        btn.disabled = false;
+        btn.textContent = 'Delete Record';
+        closeDeleteModal();
+        if (res && res.success) {
+          showToast('Record deleted from Google Sheet.', false);
+          loadInitialData();
+        } else {
+          showToast('Error deleting record: ' + (res.error || 'Unknown'), true);
+        }
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = 'Delete Record';
+        closeDeleteModal();
+        showToast('Delete failed: ' + err.message, true);
+      })
+      .apiDeletePerson(id);
+  }
+
+  function handleSaveSettings(e) {
+    e.preventDefault();
+    var email = document.getElementById('setting-email').value.trim();
+    var hour = parseInt(document.getElementById('setting-hour').value, 10);
+    var leap = document.getElementById('setting-leap').value;
+
+    showToast('Saving settings to Google Sheets...', false);
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (res && res.success) {
+          showToast('Settings saved successfully!', false);
+          appState.settings = res.settings;
+          renderAll();
+        } else {
+          showToast('Error saving settings: ' + (res.error || 'Unknown'), true);
+        }
+      })
+      .withFailureHandler(function (err) {
+        showToast('Settings error: ' + err.message, true);
+      })
+      .apiSaveSettings({
+        recipientEmail: email,
+        dailyTriggerHour: hour,
+        leapDayPolicy: leap
+      });
+  }
+
+  function installTrigger() {
+    var hour = parseInt(document.getElementById('setting-hour').value, 10) || 8;
+    showToast('Installing daily trigger in Google Apps Script...', false);
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (res && res.success) {
+          showToast('Daily reminder trigger installed for ~' + hour + ':00!', false);
+          loadInitialData();
+        } else {
+          showToast('Trigger installation failed: ' + (res.error || 'Unknown'), true);
+        }
+      })
+      .withFailureHandler(function (err) {
+        showToast('Trigger error: ' + err.message, true);
+      })
+      .apiInstallTrigger(hour);
+  }
+
+  function removeTrigger() {
+    showToast('Removing trigger...', false);
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (res && res.success) {
+          showToast('Daily trigger removed.', false);
+          loadInitialData();
+        } else {
+          showToast('Failed to remove trigger.', true);
+        }
+      })
+      .withFailureHandler(function (err) {
+        showToast('Error: ' + err.message, true);
+      })
+      .apiRemoveTrigger();
+  }
+
+  function sendTestEmail() {
+    showToast('Sending test email to configured administrator...', false);
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (res && res.success) {
+          showToast('Test email sent to ' + res.recipient + '!', false);
+          loadInitialData();
+        } else {
+          showToast('Test email failed: ' + (res.error || 'Check permissions'), true);
+        }
+      })
+      .withFailureHandler(function (err) {
+        showToast('Test email failed: ' + err.message, true);
+      })
+      .apiSendTestEmailManual();
+  }
+
+  function runManualBirthdayCheck() {
+    showToast('Executing birthday check in Asia/Kolkata...', false);
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (res && res.success) {
+          showToast(res.message || 'Birthday check completed successfully.', false);
+          loadInitialData();
+        } else {
+          showToast('Check failed: ' + (res.error || 'Unknown error'), true);
+        }
+      })
+      .withFailureHandler(function (err) {
+        showToast('Execution error: ' + err.message, true);
+      })
+      .apiRunBirthdayCheckManual();
+  }
+
+  function runSetupRoutine() {
+    showToast('Verifying Google Sheets database tabs and formatting...', false);
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (res && res.success) {
+          showToast('Database verified! Spreadsheet ID: ' + res.spreadsheetId, false);
+          loadInitialData();
+        } else {
+          showToast('Setup error: ' + (res.error || 'Failed to initialize sheet'), true);
+        }
+      })
+      .withFailureHandler(function (err) {
+        showToast('Setup error: ' + err.message, true);
+      })
+      .apiRunSetup();
+  }
+
+  function escapeHtml(text) {
+    if (!text) return '';
+    return String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+</script>

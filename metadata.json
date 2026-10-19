@@ -1,0 +1,6 @@
+{
+  "name": "Birthday Reminder — Google Sheets & Apps Script",
+  "description": "Automated birthday reminder web application powered by Google Sheets and Google Apps Script with annual email notifications, countdowns, and administration dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
