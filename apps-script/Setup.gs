@@ -143,7 +143,8 @@ var Setup = (function () {
       }
     }
 
-    var defaultEmail = Session.getActiveUser().getEmail() || '';
+    var defaultEmail = '';
+    try { defaultEmail = Session.getActiveUser().getEmail() || ''; } catch (e) {}
     var defaults = [
       ['recipientEmail', defaultEmail],
       ['dailyTriggerHour', '8'],
