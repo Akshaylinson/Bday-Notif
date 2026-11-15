@@ -677,7 +677,7 @@ var EmailService = (function () {
     }
   }
 
-  function wasAlreadySentToday(personId, todayDateStr, recipient) {
+  function wasAlreadySentToday(personId, dispatchDateStr, recipient, notificationType) {
     var ss = Setup.getSpreadsheet();
     var sheet = ss.getSheetByName(Setup.EMAIL_LOG_SHEET);
     if (!sheet) return false;
@@ -688,21 +688,22 @@ var EmailService = (function () {
     var checkCount = Math.min(lastRow - 1, 200);
     var startRow = Math.max(2, lastRow - checkCount + 1);
     var data = sheet.getRange(startRow, 1, checkCount, 8).getValues();
+    var typeTag = notificationType || 'TODAY';
 
     for (var i = 0; i < data.length; i++) {
       var row = data[i];
       var loggedPersonId = String(row[1] || '').trim();
-      var loggedDate = String(row[3] || '').trim();
       var loggedRecipient = String(row[4] || '').trim().toLowerCase();
       var loggedStatus = String(row[5] || '').trim();
-      var sentAtStr = String(row[6] || '');
-      var sentAtDay = sentAtStr.substring(0, 10);
+      var loggedError = String(row[7] || '').trim();
+      var sentAtDay = String(row[6] || '').substring(0, 10);
 
       if (
         loggedPersonId === personId &&
         loggedStatus === 'SENT' &&
         loggedRecipient === recipient.toLowerCase() &&
-        (loggedDate === todayDateStr || sentAtDay === todayDateStr)
+        sentAtDay === dispatchDateStr &&
+        loggedError.indexOf('[' + typeTag + ']') !== -1
       ) {
         return true;
       }
@@ -711,17 +712,18 @@ var EmailService = (function () {
     return false;
   }
 
-  function buildEmailHtml(birthdays, recipient, isTest) {
+  function buildEmailHtml(birthdays, recipient, isTest, isTomorrow) {
     var title = isTest
       ? '[Test Reminder] Birthday Reminder System is Active'
-      : (birthdays.length === 1
-        ? 'Birthday Today: ' + birthdays[0].person.name + '!'
-        : birthdays.length + ' Birthdays Today!');
+      : (isTomorrow
+        ? (birthdays.length === 1 ? 'Birthday Tomorrow: ' + birthdays[0].person.name + '!' : birthdays.length + ' Birthdays Tomorrow!')
+        : (birthdays.length === 1 ? 'Birthday Today: ' + birthdays[0].person.name + '!' : birthdays.length + ' Birthdays Today!'));
 
     var itemsHtml = '';
     for (var i = 0; i < birthdays.length; i++) {
       var b = birthdays[i];
       var ageText = b.turningAge > 0 ? ('Turning ' + b.turningAge + ' years old today') : 'Birthday celebration';
+      var countdownLabel = isTomorrow ? 'Birthday is Tomorrow!' : 'Birthday is Today! 🎉';
       var noteHtml = b.person.notes
         ? '<div style="margin-top: 8px; font-size: 13px; color: #475569; background: #f8fafc; padding: 10px 14px; border-radius: 6px; border-left: 3px solid #6366f1;"><strong>Notes:</strong> ' + escapeHtml(b.person.notes) + '</div>'
         : '';
@@ -732,7 +734,7 @@ var EmailService = (function () {
         '    <h2 style="margin: 0; font-size: 18px; font-weight: 700; color: #0f172a;">' + escapeHtml(b.person.name) + '</h2>',
         '    <span style="font-size: 13px; font-weight: 600; color: #4f46e5;">' + ageText + '</span>',
         '  </div>',
-        '  <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b;">Original Date of Birth: ' + b.person.dateOfBirth + ' (Month/Day: ' + b.formattedBirthday + ')</p>',
+        '  <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b;">' + countdownLabel + ' &nbsp;|&nbsp; DOB: ' + b.person.dateOfBirth + ' (' + b.formattedBirthday + ')</p>',
         noteHtml,
         '</div>'
       ].join('\\n');
@@ -822,127 +824,105 @@ var EmailService = (function () {
 
       resultSummary.checkedCount = people.length;
       var todayBirthdays = [];
+      var tomorrowBirthdays = [];
 
       for (var i = 0; i < analysis.calculations.length; i++) {
         var calc = analysis.calculations[i];
-        if (calc.isToday) {
-          todayBirthdays.push(calc);
-        }
+        if (calc.isToday) todayBirthdays.push(calc);
+        else if (calc.isTomorrow) tomorrowBirthdays.push(calc);
       }
 
       resultSummary.todayCount = todayBirthdays.length;
 
-      if (todayBirthdays.length === 0) {
+      if (todayBirthdays.length === 0 && tomorrowBirthdays.length === 0) {
         SettingsService.updateSettings({
           lastRunTimestamp: resultSummary.timestamp,
           lastRunStatus: 'SUCCESS',
-          lastRunSummary: 'Checked ' + people.length + ' people. No birthdays today (' + analysis.currentDate + ').'
+          lastRunSummary: 'Checked ' + people.length + ' people. No birthdays today or tomorrow (' + analysis.currentDate + ').'
         });
-        return { success: true, summary: resultSummary, message: 'No birthdays today.' };
+        return { success: true, summary: resultSummary, message: 'No birthdays today or tomorrow.' };
       }
 
-      var toSend = [];
-      for (var t = 0; t < todayBirthdays.length; t++) {
-        var item = todayBirthdays[t];
-        var alreadySent = wasAlreadySentToday(item.person.id, analysis.currentDate, recipient);
+      function processBatch(batch, notificationType) {
+        var toSend = [];
+        for (var t = 0; t < batch.length; t++) {
+          var item = batch[t];
+          var alreadySent = wasAlreadySentToday(item.person.id, analysis.currentDate, recipient, notificationType);
+          if (alreadySent) {
+            resultSummary.skippedDuplicateCount++;
+            resultSummary.details.push({ name: item.person.name, status: 'SKIPPED_DUPLICATE', message: 'Already sent ' + notificationType + ' reminder today' });
+            logEmail({
+              personId: item.person.id,
+              personName: item.person.name,
+              birthdayDate: item.nextBirthdayDate,
+              recipient: recipient,
+              status: 'SKIPPED_DUPLICATE',
+              errorMessage: '[' + notificationType + '] Duplicate avoided'
+            });
+          } else {
+            toSend.push(item);
+          }
+        }
+        if (toSend.length === 0) return;
 
-        if (alreadySent) {
-          resultSummary.skippedDuplicateCount++;
-          resultSummary.details.push({
-            name: item.person.name,
-            status: 'SKIPPED_DUPLICATE',
-            message: 'Already sent reminder today'
-          });
-          logEmail({
-            personId: item.person.id,
-            personName: item.person.name,
-            birthdayDate: analysis.currentDate,
-            recipient: recipient,
-            status: 'SKIPPED_DUPLICATE',
-            errorMessage: 'Duplicate avoided: Reminder already dispatched today'
-          });
+        var subject, htmlBody;
+        if (notificationType === 'TODAY') {
+          subject = toSend.length === 1
+            ? '\\uD83C\\uDF82 Birthday Today: ' + toSend[0].person.name + '!'
+            : '\\uD83C\\uDF82 ' + toSend.length + ' Birthdays Today (' + analysis.currentDate + ')';
+          htmlBody = buildEmailHtml(toSend, recipient, false, false);
         } else {
-          toSend.push(item);
+          subject = toSend.length === 1
+            ? '\\uD83C\\uDF82 Birthday Tomorrow: ' + toSend[0].person.name + '!'
+            : '\\uD83C\\uDF82 ' + toSend.length + ' Birthdays Tomorrow!';
+          htmlBody = buildEmailHtml(toSend, recipient, false, true);
+        }
+
+        try {
+          MailApp.sendEmail({ to: recipient, subject: subject, htmlBody: htmlBody });
+          for (var s = 0; s < toSend.length; s++) {
+            var pItem = toSend[s];
+            resultSummary.sentCount++;
+            resultSummary.details.push({ name: pItem.person.name, status: 'SENT', message: notificationType + ' email sent' });
+            logEmail({
+              personId: pItem.person.id,
+              personName: pItem.person.name,
+              birthdayDate: pItem.nextBirthdayDate,
+              recipient: recipient,
+              status: 'SENT',
+              errorMessage: '[' + notificationType + '] Reminder dispatched'
+            });
+          }
+        } catch (mailErr) {
+          resultSummary.failedCount += toSend.length;
+          for (var f = 0; f < toSend.length; f++) {
+            logEmail({
+              personId: toSend[f].person.id,
+              personName: toSend[f].person.name,
+              birthdayDate: toSend[f].nextBirthdayDate,
+              recipient: recipient,
+              status: 'FAILED',
+              errorMessage: '[' + notificationType + '] ' + mailErr.message
+            });
+          }
+          throw mailErr;
         }
       }
 
-      if (toSend.length === 0) {
-        SettingsService.updateSettings({
-          lastRunTimestamp: resultSummary.timestamp,
-          lastRunStatus: 'SUCCESS',
-          lastRunSummary: 'All ' + todayBirthdays.length + ' birthday(s) today were already notified.'
-        });
-        return {
-          success: true,
-          summary: resultSummary,
-          message: 'All birthdays for today have already received notifications.'
-        };
-      }
+      processBatch(todayBirthdays, 'TODAY');
+      processBatch(tomorrowBirthdays, 'TOMORROW');
 
-      var subject = (toSend.length === 1)
-        ? '🎂 Birthday Today: ' + toSend[0].person.name + '!'
-        : '🎂 ' + toSend.length + ' Birthdays Today (' + analysis.currentDate + ')';
-
-      var htmlBody = buildEmailHtml(toSend, recipient, false);
-
-      try {
-        MailApp.sendEmail({
-          to: recipient,
-          subject: subject,
-          htmlBody: htmlBody
-        });
-
-        for (var s = 0; s < toSend.length; s++) {
-          var pItem = toSend[s];
-          resultSummary.sentCount++;
-          resultSummary.details.push({
-            name: pItem.person.name,
-            status: 'SENT',
-            message: 'Email successfully sent'
-          });
-          logEmail({
-            personId: pItem.person.id,
-            personName: pItem.person.name,
-            birthdayDate: analysis.currentDate,
-            recipient: recipient,
-            status: 'SENT',
-            errorMessage: ''
-          });
-        }
-
-        SettingsService.updateSettings({
-          lastRunTimestamp: resultSummary.timestamp,
-          lastRunStatus: 'SUCCESS',
-          lastRunSummary: 'Sent reminder for ' + toSend.length + ' birthday(s) to ' + recipient + '.'
-        });
-
-      } catch (mailErr) {
-        resultSummary.failedCount += toSend.length;
-        for (var f = 0; f < toSend.length; f++) {
-          var fItem = toSend[f];
-          logEmail({
-            personId: fItem.person.id,
-            personName: fItem.person.name,
-            birthdayDate: analysis.currentDate,
-            recipient: recipient,
-            status: 'FAILED',
-            errorMessage: mailErr.message
-          });
-        }
-
-        SettingsService.updateSettings({
-          lastRunTimestamp: resultSummary.timestamp,
-          lastRunStatus: 'ERROR',
-          lastRunSummary: 'Mail send failed: ' + mailErr.message
-        });
-
-        throw mailErr;
-      }
+      var totalSent = resultSummary.sentCount;
+      SettingsService.updateSettings({
+        lastRunTimestamp: resultSummary.timestamp,
+        lastRunStatus: 'SUCCESS',
+        lastRunSummary: 'Sent ' + totalSent + ' reminder(s) to ' + recipient + ' (' + analysis.currentDate + ').'
+      });
 
       return {
         success: true,
         summary: resultSummary,
-        message: 'Successfully checked and sent ' + toSend.length + ' birthday reminder(s).'
+        message: 'Successfully sent ' + totalSent + ' birthday reminder(s).'
       };
 
     } catch (err) {
